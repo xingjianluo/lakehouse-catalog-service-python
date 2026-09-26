@@ -1,12 +1,22 @@
+"""FastAPI 入口：本地湖仓表目录服务（骨架）。"""
+
+from __future__ import annotations
+
+import tempfile
+from pathlib import Path
+
 import uvicorn
 from fastapi import FastAPI
 
-app = FastAPI()
+from lakehouse.catalog import Catalog
+
+app = FastAPI(title="lakehouse-catalog")
+catalog = Catalog(Path(tempfile.mkdtemp(prefix="lakehouse-")))
 
 
 @app.get("/")
 def read_root():
-    return {"Hello": "World"}
+    return {"service": "lakehouse-catalog", "status": "ok"}
 
 
 if __name__ == "__main__":
