@@ -1,11 +1,27 @@
 [project]
 name = "lakehouse-catalog-service-python"
 version = "0.1.0"
+description = "Local lakehouse table catalog service with versioned commits, snapshot isolation and schema evolution"
 requires-python = ">=3.14.4"
 dependencies = [
     "fastapi[standard]>=0.141.1",
 ]
 
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
+
 [[tool.uv.index]]
 url = "https://mirrors.aliyun.com/pypi/simple/"
 default = true
+
+[tool.ruff.lint]
+# B008: FastAPI uses Body()/Query() in argument defaults by design.
+# RUF012: mutable dict defaults are type-annotation-only for these fields.
+ignore = ["B008", "RUF012"]
