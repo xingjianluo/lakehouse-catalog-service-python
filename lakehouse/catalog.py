@@ -166,6 +166,77 @@ class Catalog:
         meta = self._load_table_meta(table)
         return Transaction(table=table, base_snapshot_id=meta["current_snapshot_id"])
 
+    def _validate_change(self, tx: Transaction, meta: dict) -> None:
+        """校验一笔表变更：基版本冲突检测 + 结构演进判定。失败抛 CatalogError。"""
+        current_id = meta["current_snapshot_id"]
+        if tx.base_snapshot_id != current_id:
+            raise CommitConflictError(
+                f"基于过期快照 {tx.base_snapshot_id} 提交，当前版本为 {current_id}",
+                detail={"expected_base": current_id, "actual_base": tx.base_snapshot_id},
+            )
+        if tx.new_schema is not None:
+            current_schema = (
+                self.get_snapshot(tx.table, current_id).schema
+                if current_id is not None
+                else _schema_from_dict(meta["schema"])
+            )
+            check_compatible(current_schema, tx.new_schema)
+
+    def _stage_change(
+        self, tx: Transaction, meta: dict, commit_id: str
+    ) -> tuple[Snapshot, CommitRecord]:
+        """暂存数据文件并组装新快照与提交记录（尚未落盘快照/指针）。"""
+        current_id = meta["current_snapshot_id"]
+        current_schema = (
+            self.get_snapshot(tx.table, current_id).schema
+            if current_id is not None
+            else _schema_from_dict(meta["schema"])
+        )
+        new_schema = tx.new_schema or current_schema
+
+        # 暂存数据文件（按 commit_id 隔离，失败不影响现有快照）。
+        new_files: list[PartitionFile] = []
+        for i, (partition, rows) in enumerate(tx.adds):
+            rel = self._table_dir(tx.table) / "data" / commit_id / f"part-{i:05d}.jsonl"
+            self.storage.write_data_file(rel, rows)
+            new_files.append(PartitionFile(str(rel), partition, len(rows)))
+
+        # 组装新快照：继承现有文件，应用删除与新增。
+        existing: list[PartitionFile] = []
+        if current_id is not None:
+            existing = list(self.get_snapshot(tx.table, current_id).files)
+        removed = set(tx.removes)
+        files = tuple(f for f in existing if f.path not in removed) + tuple(new_files)
+
+        snapshot = Snapshot(
+            snapshot_id=meta["next_snapshot_id"],
+            commit_id=commit_id,
+            parent_snapshot_id=current_id,
+            schema=new_schema,
+            files=files,
+            created_at=time.time(),
+            summary=dict(tx.summary),
+        )
+        record = CommitRecord(
+            commit_id=commit_id, table=tx.table,
+            base_snapshot_id=tx.base_snapshot_id, snapshot_id=snapshot.snapshot_id,
+            status="committed", reason=None,
+            detail={"files_added": len(new_files), "files_removed": len(removed)},
+        )
+        return snapshot, record
+
+    def _persist_change(
+        self, table: str, meta: dict, snapshot: Snapshot, record: CommitRecord
+    ) -> None:
+        """先写快照与提交记录，最后原子切换表指针：整体生效或整体失败。"""
+        self.storage.write_json_atomic(
+            self._snapshot_path(table, snapshot.snapshot_id), _snapshot_to_dict(snapshot))
+        self.storage.write_json_atomic(self._commit_path(table, record.commit_id),
+                                       _record_to_dict(record))
+        meta["current_snapshot_id"] = snapshot.snapshot_id
+        meta["next_snapshot_id"] = snapshot.snapshot_id + 1
+        self.storage.write_json_atomic(self._table_meta_path(table), meta)
+
     def commit(self, tx: Transaction, *, commit_id: str | None = None) -> Snapshot:
         if tx.finished:
             raise CatalogError("事务已结束，不能重复提交", detail={"table": tx.table})
@@ -185,80 +256,22 @@ class Catalog:
                 )
 
             meta = self._load_table_meta(tx.table)
-            current_id = meta["current_snapshot_id"]
 
-            # 冲突检测：基版本过期则整体拒绝，并记录审计。
-            if tx.base_snapshot_id != current_id:
+            # 冲突检测与结构演进判定：失败则整体拒绝，并记录审计。
+            try:
+                self._validate_change(tx, meta)
+            except CatalogError as e:
                 record = CommitRecord(
                     commit_id=commit_id, table=tx.table,
                     base_snapshot_id=tx.base_snapshot_id, snapshot_id=None,
-                    status="rejected", reason=CommitConflictError.reason,
-                    detail={"expected_base": current_id, "actual_base": tx.base_snapshot_id},
+                    status="rejected", reason=e.reason, detail=e.detail,
                 )
                 self.storage.write_json_atomic(commit_path, _record_to_dict(record))
                 tx.finished = True
-                raise CommitConflictError(
-                    f"基于过期快照 {tx.base_snapshot_id} 提交，当前版本为 {current_id}",
-                    detail=record.detail,
-                )
+                raise
 
-            # 结构演进判定：在提交点一次性完成，失败则整体拒绝。
-            current_schema = (
-                self.get_snapshot(tx.table, current_id).schema
-                if current_id is not None
-                else _schema_from_dict(meta["schema"])
-            )
-            new_schema = tx.new_schema or current_schema
-            if tx.new_schema is not None:
-                try:
-                    check_compatible(current_schema, tx.new_schema)
-                except CatalogError as e:
-                    record = CommitRecord(
-                        commit_id=commit_id, table=tx.table,
-                        base_snapshot_id=tx.base_snapshot_id, snapshot_id=None,
-                        status="rejected", reason=e.reason, detail=e.detail,
-                    )
-                    self.storage.write_json_atomic(commit_path, _record_to_dict(record))
-                    tx.finished = True
-                    raise
-
-            # 暂存数据文件（按 commit_id 隔离，失败不影响现有快照）。
-            new_files: list[PartitionFile] = []
-            for i, (partition, rows) in enumerate(tx.adds):
-                rel = self._table_dir(tx.table) / "data" / commit_id / f"part-{i:05d}.jsonl"
-                self.storage.write_data_file(rel, rows)
-                new_files.append(PartitionFile(str(rel), partition, len(rows)))
-
-            # 组装新快照：继承现有文件，应用删除与新增。
-            existing: list[PartitionFile] = []
-            if current_id is not None:
-                existing = list(self.get_snapshot(tx.table, current_id).files)
-            removed = set(tx.removes)
-            files = tuple(f for f in existing if f.path not in removed) + tuple(new_files)
-
-            snapshot = Snapshot(
-                snapshot_id=meta["next_snapshot_id"],
-                commit_id=commit_id,
-                parent_snapshot_id=current_id,
-                schema=new_schema,
-                files=files,
-                created_at=time.time(),
-                summary=dict(tx.summary),
-            )
-
-            # 先写快照与提交记录，最后原子切换表指针：整体生效或整体失败。
-            self.storage.write_json_atomic(
-                self._snapshot_path(tx.table, snapshot.snapshot_id), _snapshot_to_dict(snapshot))
-            record = CommitRecord(
-                commit_id=commit_id, table=tx.table,
-                base_snapshot_id=tx.base_snapshot_id, snapshot_id=snapshot.snapshot_id,
-                status="committed", reason=None,
-                detail={"files_added": len(new_files), "files_removed": len(removed)},
-            )
-            self.storage.write_json_atomic(commit_path, _record_to_dict(record))
-            meta["current_snapshot_id"] = snapshot.snapshot_id
-            meta["next_snapshot_id"] = snapshot.snapshot_id + 1
-            self.storage.write_json_atomic(self._table_meta_path(tx.table), meta)
+            snapshot, record = self._stage_change(tx, meta, commit_id)
+            self._persist_change(tx.table, meta, snapshot, record)
             tx.finished = True
             return snapshot
 

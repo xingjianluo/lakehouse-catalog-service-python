@@ -58,3 +58,38 @@ class SchemaColumnRenamedError(SchemaEvolutionError):
 
 class SchemaDefaultMissingError(SchemaEvolutionError):
     reason = "schema_default_missing"
+
+
+# ---------- 跨表事务 ----------
+
+class TxnConflictError(CatalogError):
+    """跨表事务被拒绝：至少一张表基版本过期或结构不兼容。
+
+    detail["failures"] 逐表给出 {reason, detail}，便于定位是哪张表、为什么失败。
+    """
+
+    reason = "txn_conflict"
+
+
+class TxnNotFoundError(CatalogError):
+    """按事务标识读取时，该事务从未提交过。"""
+
+    reason = "txn_not_found"
+
+
+class TxnNotCommittedError(CatalogError):
+    """事务存在但被整体拒绝，没有可读取的快照组。"""
+
+    reason = "txn_not_committed"
+
+
+class TxnTableNotInvolvedError(CatalogError):
+    """请求的表没有参与这笔事务。"""
+
+    reason = "txn_table_not_involved"
+
+
+class TxnSnapshotUnavailableError(CatalogError):
+    """事务产生的快照已被清理回收，按事务读取不到当时的版本。"""
+
+    reason = "txn_snapshot_unavailable"
