@@ -8,13 +8,14 @@
 
 ```
 lakehouse/
-  models.py    # Column / Schema / PartitionFile / Snapshot / CommitRecord
-  errors.py    # 可区分错误类型，每个错误带 machine-readable reason
-  schema.py    # 结构演进兼容性判定与默认值回填
-  storage.py   # 本地存储：原子写（tmp + os.replace）
-  catalog.py   # 目录核心：提交协议、快照读取、pin 与清理
-main.py        # FastAPI 入口，错误 reason -> HTTP 状态码映射
-tests/         # 并发冲突、幂等重试、不兼容演进等测试
+  models.py      # Column / Schema / PartitionFile / Snapshot / CommitRecord
+  errors.py      # 可区分错误类型，每个错误带 machine-readable reason
+  schema.py      # 结构演进兼容性判定与默认值回填
+  storage.py     # 本地存储：原子写（tmp + os.replace）
+  transaction.py # 跨表事务数据模型：MultiTableTransaction / TableChange / TransactionResult
+  catalog.py     # 目录核心：提交协议、快照读取、pin 与清理、跨表事务
+main.py          # FastAPI 入口，错误 reason -> HTTP 状态码映射
+tests/           # 并发冲突、幂等重试、不兼容演进、跨表事务等测试
 ```
 
 ## 磁盘布局
@@ -26,6 +27,7 @@ tests/         # 并发冲突、幂等重试、不兼容演进等测试
   commits/<commit_id>.json   # 提交记录（幂等键 + 审计，含拒绝原因）
   pins.json                  # 快照引用计数
   data/<commit_id>/...       # 分区数据文件（jsonl，按提交隔离）
+<root>/_transactions/<txn_id>.json  # 跨表事务记录（幂等键 + 各表快照/拒绝原因）
 ```
 
 ## 提交协议（乐观并发控制）
@@ -44,6 +46,33 @@ tests/         # 并发冲突、幂等重试、不兼容演进等测试
      读者任一时刻只能看到完整快照。
 3. HTTP 入口 `POST /tables/{table}/commits` 把 begin+commit 合并为一次请求，
    `base_snapshot_id` 为必填可空字段（`null` 表示建表后尚无提交）。
+
+## 跨表事务
+
+一笔事务（`txn_id` 标识）可同时覆盖多张表：**全部生效或全部不生效**。
+
+提交协议（`commit_tables`，HTTP `POST /transactions/{txn_id}/commits`）：
+
+1. 按表名排序依次加表级锁 —— 并发事务不会死锁，**书写顺序不影响结果**。
+2. **幂等**：`txn_id` 已有事务记录时直接返回首次结果（同一组快照，或相同的
+   拒绝原因），重试/重放不产生新版本。
+3. **校验阶段**：逐表检查基版本与结构演进。任一表失败则整笔拒绝，
+   `transaction_conflict` 的 `detail.tables` 逐表列出各自的 reason 与细节
+   （哪张表、期望/实际基版本、或具体 schema 不兼容原因）。
+4. **生效阶段**：校验全部通过后逐表暂存（数据文件 → 快照 → 提交记录），
+   先落事务记录，最后统一翻各表指针 —— 校验通过后生效阶段不再产生新的失败，
+   并发提交不会出现只有一部分表生效。
+
+一致性读取（`GET /transactions/{txn_id}/snapshots` 或
+`/transactions/{txn_id}/tables/{table}/snapshot`）：
+
+- 按 `txn_id` 返回该事务在**所有参与表**上产生的一组快照，这组快照互相自洽
+  （都能看到这笔事务里的全部变更）。
+- 可区分的拒绝（与普通读取失败不同）：
+  - `transaction_not_found`（404）：事务不存在、事务被拒绝、或该表未参与此事务；
+  - `transaction_snapshot_unavailable`（410）：事务曾成功，但对应快照已被
+    清理回收 —— 强调"曾经存在、现在读不到"，与 `snapshot_not_found` 区分。
+- 若需要长期可读，可对事务产生的各表快照 `pin_snapshot` 防止被清理回收。
 
 ## 快照保留与清理策略
 
@@ -73,16 +102,19 @@ tests/         # 并发冲突、幂等重试、不兼容演进等测试
 
 所有失败返回 `{"reason", "message", "detail"}`：
 
-- 404：`table_not_found`、`snapshot_not_found`
-- 409：`commit_conflict`、`table_already_exists`
+- 404：`table_not_found`、`snapshot_not_found`、`transaction_not_found`
+- 409：`commit_conflict`、`table_already_exists`、`transaction_conflict`
+  （`detail.tables` 逐表给出失败原因）
+- 410：`transaction_snapshot_unavailable`（事务快照已被回收）
 - 422：`schema_*` 系列（见上表）
 
 ## 本地验证
 
 ```bash
 uv sync                 # 安装依赖
-uv run pytest           # 全部测试（实时打印 commit_id / snapshot_id / 判定依据）
+uv run pytest           # 全部测试（实时打印 commit_id / txn_id / snapshot_id / 判定依据）
 uv run pytest tests/test_catalog.py::test_concurrent_commits_exactly_one_wins
+uv run pytest tests/test_transaction.py   # 跨表事务：并发/幂等/一致读取/回收拒绝
 
 # 启动 HTTP 服务（数据目录可用 LAKEHOUSE_ROOT 指定，默认临时目录）
 LAKEHOUSE_ROOT=/tmp/wh uv run python main.py   # 监听 127.0.0.1 随机端口
@@ -94,4 +126,12 @@ HTTP 示例：
 curl -X POST :$PORT/tables -d '{"table":"t","columns":[{"name":"id","type":"long"}]}' -H 'content-type: application/json'
 curl -X POST :$PORT/tables/t/commits -d '{"commit_id":"c1","base_snapshot_id":null,"adds":[{"partition":{"d":"1"},"rows":[{"id":1}]}]}' -H 'content-type: application/json'
 curl ":$PORT/tables/t/rows?snapshot_id=1"
+
+# 跨表事务：一次提交覆盖 detail 与 summary 两张表
+curl -X POST :$PORT/transactions/txn-1/commits -d '{"tables":{
+  "detail": {"base_snapshot_id":null,"adds":[{"partition":{"d":"1"},"rows":[{"id":1}]}]},
+  "summary":{"base_snapshot_id":null,"adds":[{"partition":{"d":"1"},"rows":[{"id":1}]}]}
+}}' -H 'content-type: application/json'
+curl :$PORT/transactions/txn-1/snapshots          # 整组自洽快照
+curl :$PORT/transactions/txn-1/tables/detail/snapshot
 ```

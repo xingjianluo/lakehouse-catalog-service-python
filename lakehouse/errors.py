@@ -58,3 +58,27 @@ class SchemaColumnRenamedError(SchemaEvolutionError):
 
 class SchemaDefaultMissingError(SchemaEvolutionError):
     reason = "schema_default_missing"
+
+
+class TransactionConflictError(CatalogError):
+    """跨表事务被拒绝：至少一张表基版本过期或结构演进不兼容。
+
+    detail 中携带 per-table 的失败原因，便于调用方定位是哪张表、为什么失败。
+    """
+
+    reason = "transaction_conflict"
+
+
+class TransactionNotFoundError(CatalogError):
+    """按事务标识读取时，该事务从未提交过（或某张表未参与该事务）。"""
+
+    reason = "transaction_not_found"
+
+
+class TransactionSnapshotUnavailableError(CatalogError):
+    """事务存在，但其引用的快照已被回收，无法还原当时的一致性视图。
+
+    与普通的 snapshot_not_found 区分：这里强调"曾经存在、现在读不到"。
+    """
+
+    reason = "transaction_snapshot_unavailable"

@@ -27,8 +27,12 @@ from lakehouse.errors import (
     SnapshotNotFoundError,
     TableAlreadyExistsError,
     TableNotFoundError,
+    TransactionConflictError,
+    TransactionNotFoundError,
+    TransactionSnapshotUnavailableError,
 )
 from lakehouse.models import Column, Schema
+from lakehouse.transaction import MultiTableTransaction
 
 CATALOG_ROOT = Path(os.environ.get("LAKEHOUSE_ROOT", tempfile.mkdtemp(prefix="lakehouse-")))
 catalog = Catalog(CATALOG_ROOT)
@@ -38,9 +42,13 @@ app = FastAPI(title="lakehouse-catalog")
 @app.exception_handler(CatalogError)
 async def catalog_error_handler(_: Request, exc: CatalogError) -> JSONResponse:
     status = 400
-    if isinstance(exc, (TableNotFoundError, SnapshotNotFoundError)):
+    if isinstance(exc, TransactionSnapshotUnavailableError):
+        status = 410  # 曾经存在、已被回收，与 404 区分
+    elif isinstance(exc, (TableNotFoundError, SnapshotNotFoundError,
+                          TransactionNotFoundError)):
         status = 404
-    elif isinstance(exc, (CommitConflictError, TableAlreadyExistsError)):
+    elif isinstance(exc, (CommitConflictError, TableAlreadyExistsError,
+                          TransactionConflictError)):
         status = 409
     elif isinstance(exc, SchemaEvolutionError):
         status = 422
@@ -77,6 +85,12 @@ class CommitIn(BaseModel):
     removes: list[str] = []
     new_columns: list[ColumnIn] | None = None  # 完整新结构（提供则触发演进判定）
     summary: dict[str, Any] = {}
+
+
+class TxnCommitIn(BaseModel):
+    """跨表事务提交：tables 以表名为键，每张表声明各自的基版本与变更。"""
+
+    tables: dict[str, CommitIn]
 
 
 def _to_schema(cols: list[ColumnIn]) -> Schema:
@@ -174,6 +188,45 @@ def cleanup(table: str):
 @app.get("/tables/{table}/commits")
 def commit_log(table: str):
     return {"commits": catalog.commit_log(table)}
+
+
+# ---------- 跨表事务 ----------
+
+@app.post("/transactions/{txn_id}/commits", status_code=201)
+def commit_transaction(txn_id: str, body: TxnCommitIn):
+    """一次请求完成一笔跨表事务：所有表全部生效或全部不生效。
+
+    txn_id 为幂等键：同一 txn_id 重放返回与首次完全一致的结果。
+    """
+    txn = MultiTableTransaction(txn_id)
+    for name, tc in body.tables.items():
+        change = txn.table(name, tc.base_snapshot_id)
+        for add in tc.adds:
+            change.add_partition(add.partition, add.rows)
+        for path in tc.removes:
+            change.remove_file(path)
+        if tc.new_columns is not None:
+            change.set_schema(_to_schema(tc.new_columns))
+        change.summary.update(tc.summary)
+    result = catalog.commit_tables(txn)
+    return {
+        "txn_id": result.txn_id,
+        "snapshots": {t: _snapshot_out(s) for t, s in result.snapshots.items()},
+    }
+
+
+@app.get("/transactions/{txn_id}/snapshots")
+def transaction_snapshots(txn_id: str):
+    """按事务标识读取整组自洽快照。"""
+    group = catalog.transaction_snapshots(txn_id)
+    return {"txn_id": txn_id,
+            "snapshots": {t: _snapshot_out(s) for t, s in group.items()}}
+
+
+@app.get("/transactions/{txn_id}/tables/{table}/snapshot")
+def transaction_snapshot(txn_id: str, table: str):
+    """按事务标识读取某张参与表在该事务中的快照。"""
+    return _snapshot_out(catalog.transaction_snapshot(txn_id, table))
 
 
 if __name__ == "__main__":
