@@ -27,6 +27,11 @@ from lakehouse.errors import (
     SnapshotNotFoundError,
     TableAlreadyExistsError,
     TableNotFoundError,
+    TxnConflictError,
+    TxnNotCommittedError,
+    TxnNotFoundError,
+    TxnSnapshotUnavailableError,
+    TxnTableNotInvolvedError,
 )
 from lakehouse.models import Column, Schema
 
@@ -38,10 +43,14 @@ app = FastAPI(title="lakehouse-catalog")
 @app.exception_handler(CatalogError)
 async def catalog_error_handler(_: Request, exc: CatalogError) -> JSONResponse:
     status = 400
-    if isinstance(exc, (TableNotFoundError, SnapshotNotFoundError)):
+    if isinstance(exc, (TableNotFoundError, SnapshotNotFoundError,
+                       TxnNotFoundError, TxnTableNotInvolvedError)):
         status = 404
-    elif isinstance(exc, (CommitConflictError, TableAlreadyExistsError)):
+    elif isinstance(exc, (CommitConflictError, TableAlreadyExistsError,
+                          TxnConflictError, TxnNotCommittedError)):
         status = 409
+    elif isinstance(exc, TxnSnapshotUnavailableError):
+        status = 410
     elif isinstance(exc, SchemaEvolutionError):
         status = 422
     return JSONResponse(
@@ -77,6 +86,22 @@ class CommitIn(BaseModel):
     removes: list[str] = []
     new_columns: list[ColumnIn] | None = None  # 完整新结构（提供则触发演进判定）
     summary: dict[str, Any] = {}
+
+
+class TxnTableIn(BaseModel):
+    """跨表事务中一张表的变更，字段语义与单表 CommitIn 一致。"""
+
+    table: str
+    base_snapshot_id: int | None
+    adds: list[PartitionAddIn] = []
+    removes: list[str] = []
+    new_columns: list[ColumnIn] | None = None
+    summary: dict[str, Any] = {}
+
+
+class TxnCommitIn(BaseModel):
+    txn_id: str | None = None
+    tables: list[TxnTableIn]
 
 
 def _to_schema(cols: list[ColumnIn]) -> Schema:
@@ -174,6 +199,43 @@ def cleanup(table: str):
 @app.get("/tables/{table}/commits")
 def commit_log(table: str):
     return {"commits": catalog.commit_log(table)}
+
+
+# ---------- 跨表事务 ----------
+
+@app.post("/txns", status_code=201)
+def commit_txn(body: TxnCommitIn):
+    """跨表原子提交：全部表生效或全部拒绝，txn_id 为幂等键。"""
+    txn = catalog.begin_txn([t.table for t in body.tables])
+    for t in body.tables:
+        change = txn.change(t.table)
+        change.base_snapshot_id = t.base_snapshot_id
+        for add in t.adds:
+            change.add_partition(add.partition, add.rows)
+        for path in t.removes:
+            change.remove_file(path)
+        if t.new_columns is not None:
+            change.set_schema(_to_schema(t.new_columns))
+        change.summary.update(t.summary)
+    snaps = catalog.commit_txn(txn, txn_id=body.txn_id)
+    txn_id = next(iter(snaps.values())).commit_id
+    return {"txn_id": txn_id,
+            "snapshots": {t: _snapshot_out(s) for t, s in snaps.items()}}
+
+
+@app.get("/txns/{txn_id}")
+def get_txn(txn_id: str):
+    """按事务标识读取整组自洽快照。"""
+    snaps = catalog.get_txn_snapshots(txn_id)
+    return {"txn_id": txn_id,
+            "snapshots": {t: _snapshot_out(s) for t, s in snaps.items()}}
+
+
+@app.get("/txns/{txn_id}/tables/{table}/rows")
+def get_txn_rows(txn_id: str, table: str):
+    """按事务标识读取其中一张表当时的行。"""
+    snap = catalog.get_txn_snapshot(txn_id, table)
+    return {"rows": catalog.read_rows(table, snap.snapshot_id)}
 
 
 if __name__ == "__main__":
