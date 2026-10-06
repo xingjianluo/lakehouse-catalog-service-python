@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import threading
 import time
 import uuid
@@ -31,6 +32,11 @@ from .errors import (
     SnapshotNotFoundError,
     TableAlreadyExistsError,
     TableNotFoundError,
+    TxnConflictError,
+    TxnNotCommittedError,
+    TxnNotFoundError,
+    TxnSnapshotUnavailableError,
+    TxnTableNotInvolvedError,
 )
 from .models import Column, CommitRecord, PartitionFile, Schema, Snapshot
 from .schema import backfill_row, check_compatible
@@ -114,6 +120,26 @@ class Transaction:
         return self
 
 
+@dataclass
+class MultiTxn:
+    """一次跨表事务：多张表的变更要么全部生效，要么全部不生效。
+
+    changes 按表名持有每张表暂存的变更（复用单表 Transaction），
+    提交时按表名排序依次校验与落盘，与书写顺序无关。
+    """
+
+    changes: dict[str, Transaction] = field(default_factory=dict)
+    finished: bool = False
+
+    def change(self, table: str) -> Transaction:
+        """取某张表的暂存变更句柄（不存在则抛 KeyError，由 begin_txn 预建）。"""
+        return self.changes[table]
+
+    @property
+    def tables(self) -> list[str]:
+        return sorted(self.changes)
+
+
 # ---------- 目录 ----------
 
 class Catalog:
@@ -122,6 +148,9 @@ class Catalog:
         self.retain_last = retain_last
         self._locks: dict[str, threading.Lock] = {}
         self._locks_guard = threading.Lock()
+        # 跨表事务串行化：同一时刻只有一笔多表事务进入提交流程，
+        # 表级锁仍按表名排序获取，与单表提交互斥。
+        self._txn_lock = threading.Lock()
 
     # ---- 路径 ----
     def _table_dir(self, table: str) -> Path:
@@ -138,6 +167,9 @@ class Catalog:
 
     def _pins_path(self, table: str) -> Path:
         return self._table_dir(table) / "pins.json"
+
+    def _txn_path(self, txn_id: str) -> Path:
+        return Path("txns") / f"{txn_id}.json"
 
     def _lock_for(self, table: str) -> threading.Lock:
         with self._locks_guard:
@@ -274,6 +306,152 @@ class Catalog:
             self._persist_change(tx.table, meta, snapshot, record)
             tx.finished = True
             return snapshot
+
+    # ---- 跨表事务 ----
+    def begin_txn(self, tables: list[str]) -> MultiTxn:
+        """为一批表开启跨表事务：记录每张表当时的基版本。"""
+        names = sorted(set(tables))
+        if not names:
+            raise CatalogError("跨表事务至少包含一张表", detail={"tables": tables})
+        changes = {t: self.begin_commit(t) for t in names}
+        return MultiTxn(changes=changes)
+
+    def commit_txn(self, txn: MultiTxn, *, txn_id: str | None = None) -> dict[str, Snapshot]:
+        """原子提交跨表事务：全部表生效或全部不生效。
+
+        - 任一表基版本过期/结构不兼容 -> 整笔拒绝（TxnConflictError，逐表原因）；
+        - 同一 txn_id 重试返回首次结果（成功返回同一组快照，失败返回相同原因）；
+        - 与表的书写顺序无关（内部按表名排序处理）。
+        """
+        if txn.finished:
+            raise CatalogError("事务已结束，不能重复提交", detail={"tables": txn.tables})
+        if not txn.changes:
+            raise CatalogError("跨表事务至少包含一张表", detail={})
+        txn_id = txn_id or uuid.uuid4().hex
+        with self._txn_lock:
+            txn_path = self._txn_path(txn_id)
+            # 幂等：同一 txn_id 已提交过，直接返回首次结果（成功快照组或相同拒绝原因）。
+            if self.storage.exists(txn_path):
+                record = self.storage.read_json(txn_path)
+                txn.finished = True
+                if record["status"] == "committed":
+                    return {t: _snapshot_from_dict(s)
+                            for t, s in record["snapshots"].items()}
+                raise TxnConflictError(
+                    f"txn {txn_id} 此前已被整体拒绝",
+                    detail={"txn_id": txn_id, "failures": record["failures"]},
+                )
+
+            # 按表名排序获取全部表锁：与单表提交互斥，且避免死锁。
+            with contextlib.ExitStack() as stack:
+                for t in txn.tables:
+                    stack.enter_context(self._lock_for(t))
+
+                # 第一阶段：逐表校验（基版本 + 结构演进），收集全部失败。
+                metas: dict[str, dict] = {}
+                failures: dict[str, dict] = {}
+                for t in txn.tables:
+                    tx = txn.changes[t]
+                    try:
+                        metas[t] = self._load_table_meta(t)
+                        self._validate_change(tx, metas[t])
+                    except CatalogError as e:
+                        failures[t] = {"reason": e.reason, "detail": e.detail}
+
+                if failures:
+                    # 整体拒绝：任何表都不生效。失败表写 per-table 审计记录。
+                    for t, f in failures.items():
+                        tx = txn.changes[t]
+                        record = CommitRecord(
+                            commit_id=txn_id, table=t,
+                            base_snapshot_id=tx.base_snapshot_id, snapshot_id=None,
+                            status="rejected", reason=f["reason"], detail=f["detail"],
+                        )
+                        self.storage.write_json_atomic(
+                            self._commit_path(t, txn_id), _record_to_dict(record))
+                    self.storage.write_json_atomic(txn_path, {
+                        "txn_id": txn_id,
+                        "status": "rejected",
+                        "tables": txn.tables,
+                        "failures": failures,
+                        "created_at": time.time(),
+                    })
+                    txn.finished = True
+                    raise TxnConflictError(
+                        f"txn {txn_id} 中 {len(failures)} 张表校验失败，整笔事务被拒绝",
+                        detail={"txn_id": txn_id, "failures": failures},
+                    )
+
+                # 第二阶段：全部校验通过，暂存各表数据文件并组装快照。
+                staged = {
+                    t: self._stage_change(txn.changes[t], metas[t], txn_id)
+                    for t in txn.tables
+                }
+
+                # 第三阶段：先落盘全部快照与 per-table 提交记录，
+                # 再写全局事务记录（committed），最后逐表原子切换指针。
+                for t in txn.tables:
+                    snapshot, record = staged[t]
+                    self.storage.write_json_atomic(
+                        self._snapshot_path(t, snapshot.snapshot_id),
+                        _snapshot_to_dict(snapshot))
+                    self.storage.write_json_atomic(
+                        self._commit_path(t, txn_id), _record_to_dict(record))
+                self.storage.write_json_atomic(txn_path, {
+                    "txn_id": txn_id,
+                    "status": "committed",
+                    "tables": txn.tables,
+                    "snapshots": {t: _snapshot_to_dict(staged[t][0]) for t in txn.tables},
+                    "created_at": time.time(),
+                })
+                for t in txn.tables:
+                    snapshot, _ = staged[t]
+                    meta = metas[t]
+                    meta["current_snapshot_id"] = snapshot.snapshot_id
+                    meta["next_snapshot_id"] = snapshot.snapshot_id + 1
+                    self.storage.write_json_atomic(self._table_meta_path(t), meta)
+
+                txn.finished = True
+                return {t: staged[t][0] for t in txn.tables}
+
+    def _load_txn_record(self, txn_id: str) -> dict:
+        """读取事务记录：不存在 -> txn_not_found；被拒绝 -> txn_not_committed。"""
+        path = self._txn_path(txn_id)
+        if not self.storage.exists(path):
+            raise TxnNotFoundError(
+                f"事务 {txn_id!r} 不存在", detail={"txn_id": txn_id})
+        record = self.storage.read_json(path)
+        if record["status"] != "committed":
+            raise TxnNotCommittedError(
+                f"事务 {txn_id!r} 被整体拒绝，没有可读取的快照组",
+                detail={"txn_id": txn_id, "failures": record.get("failures", {})},
+            )
+        return record
+
+    def _txn_table_snapshot(self, txn_id: str, record: dict, table: str) -> Snapshot:
+        if table not in record["tables"]:
+            raise TxnTableNotInvolvedError(
+                f"表 {table!r} 未参与事务 {txn_id!r}",
+                detail={"txn_id": txn_id, "table": table, "tables": record["tables"]},
+            )
+        snapshot_id = record["snapshots"][table]["snapshot_id"]
+        try:
+            return self.get_snapshot(table, snapshot_id)
+        except SnapshotNotFoundError:
+            raise TxnSnapshotUnavailableError(
+                f"事务 {txn_id!r} 中表 {table!r} 的快照 {snapshot_id} 已被回收，无法按事务读取",
+                detail={"txn_id": txn_id, "table": table, "snapshot_id": snapshot_id},
+            ) from None
+
+    def get_txn_snapshots(self, txn_id: str) -> dict[str, Snapshot]:
+        """按事务标识读取整组快照：互相自洽，包含该事务的全部变更。"""
+        record = self._load_txn_record(txn_id)
+        return {t: self._txn_table_snapshot(txn_id, record, t) for t in record["tables"]}
+
+    def get_txn_snapshot(self, txn_id: str, table: str) -> Snapshot:
+        """按事务标识读取其中一张表的快照。"""
+        record = self._load_txn_record(txn_id)
+        return self._txn_table_snapshot(txn_id, record, table)
 
     # ---- 读取 ----
     def current_snapshot(self, table: str) -> Snapshot:
